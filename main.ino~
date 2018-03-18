@@ -1,0 +1,229 @@
+#include <i2c_t3.h>
+#include <Stepper.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "DRV8825.h"
+
+#define OLED_RESET 4
+#define SERIAL_SPEED   115200
+#define ICON_MAX    5
+#define MOTOR_STEPS 200
+#define RPM 120
+
+#define M0       5
+#define M1       4
+#define M2       3
+#define STEP     6
+#define DIR      8
+#define ENABLE   7
+#define FAULT    9
+#define BTN_PIN  2
+#define FOOT_PIN 11
+
+DRV8825 stepper(MOTOR_STEPS, DIR, STEP, ENABLE, M0, M1, M2);
+
+#define S_IDLE            1
+#define S_START_PULSE     2
+#define S_MOTOR_PULSE     3
+#define S_START_CONT      4
+#define S_MOTOR_PULSE     5
+#define S_CONTINUOUS      6
+#define S_STOP            7
+
+elapsedMillis elapsedRunTime;
+
+elapsedMillis elapsedBtn1Time;
+uint16_t btn1Delay = 200;
+uint8_t btn1State = false;
+boolean btn1Pressed = false;
+
+elapsedMillis elapsedBtn2Time;
+uint32_t btn2Delay = 200;
+uint8_t btn2State = false;
+boolean btn2Pressed = false;
+boolean btn2Released = false;
+
+uint8_t count = 0;
+
+uint8_t settingNum = 0;
+uint8_t oldDisplayNum = 0;
+uint8_t displayMax = 6;
+
+String inputString = "";
+
+uint16_t STEPS = 200;
+uint16_t pos = 0;
+uint8_t state = S_IDLE;
+
+char *iconNames[] = {"FWD", "REV", "Prg1", "Prg2", "Prg3"};
+int16_t progTime[] = {0, 0, 10, 200, 2000};
+int16_t progMicroSteps[] = {1, 1, 32, 32, 32};
+
+Adafruit_SSD1306 display(OLED_RESET);
+
+void setup() {
+  inputString.reserve(200);
+  Serial.begin(SERIAL_SPEED);
+  Wire.begin(I2C_MASTER, 0x00, I2C_PINS_18_19, I2C_PULLUP_EXT, I2C_RATE_1200);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);  
+      
+  stepper.begin(RPM);
+  stepper.disable();
+
+  pinMode(FAULT, INPUT);  
+  pinMode(BTN_PIN, INPUT);  
+  pinMode(FOOT_PIN, INPUT);  
+
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  
+  updateDisplay();
+}
+
+void updateDisplay() {
+  display.clearDisplay();
+  display.setTextSize(3);
+  display.setCursor(50,5); display.print(iconNames[settingNum]);
+  
+
+  display.setTextSize(1);
+
+  display.setCursor(0,5); display.print(iconNames[settingNum]);
+
+  display.setCursor(0,25); display.print("T:");
+  display.setCursor(14,25); display.print(progTime[settingNum]);
+  
+  display.setCursor(0,45); display.print("M:");
+  display.setCursor(14,45); display.print(progMicroSteps[settingNum]);
+  
+  display.display();
+}
+
+void doEachLoop() {
+  checkUSBSerial();
+
+  if (btn1Pressed && elapsedBtn1Time > btn1Delay) {
+    if (digitalRead(BTN_PIN) == LOW) { // released
+      settingNum++;
+      if (settingNum == ICON_MAX) { settingNum = 0; }
+    }
+  }
+  if (digitalRead(BTN_PIN) == HIGH && btn1Pressed == false) {
+    elapsedBtn1Time = 0;
+    btn1Pressed = true;
+  }
+  if (digitalRead(BTN_PIN) == LOW) {btn1Pressed = false; }
+
+
+  if (btn2Pressed && elapsedBtn2Time > btn2Delay) {
+    if (digitalRead(FOOT_PIN) == LOW) { // released
+      if (settingNum != 0 && settingNum != 1) { state = S_START_PULSE; }
+    }
+    if (settingNum == 0 || settingNum == 1) { state = S_CONTINUOUS; }
+  }
+  if (digitalRead(FOOT_PIN) == HIGH && btn2Pressed == false) {
+    elapsedBtn2Time = 0;
+    btn2Pressed = true;
+  }
+  if (digitalRead(FOOT_PIN) == LOW) {btn2Pressed = false; }
+
+  if (settingNum != oldDisplayNum) {
+    updateDisplay();
+    oldDisplayNum = settingNum;
+    btn1Pressed = false;
+  }
+}
+
+int x = 0;
+void loop() {
+  doEachLoop();
+
+  switch (state) {
+  case S_CONTINUOUS:
+
+    stepper.setMicrostep(progMicroSteps[settingNum]);
+    stepper.enable();
+
+    if (settingNum == 0) { stepper.move(-100); }
+    if (settingNum == 1) { stepper.move(100); }
+
+    state = S_IDLE;
+    break;
+
+  case S_START_PULSE:
+    display.setTextSize(3);
+    display.setCursor(60,40); display.print("*");
+    display.display();
+    stepper.setMicrostep(progMicroSteps[settingNum]);
+    stepper.enable();
+
+    state = S_MOTOR_PULSE;
+    count = 0;
+
+    break;
+
+  case S_MOTOR_PULSE:
+
+    stepper.move(progTime[settingNum] * -1);
+    delay(200);
+    stepper.move(progTime[settingNum] / 2);
+    delay(500);
+
+    
+    state = S_STOP;
+    break;
+
+  case S_STOP:
+    display.fillRect(40, 40, 50, 45, BLACK);
+    display.display();
+
+    state = S_IDLE;
+    break;
+
+  case S_IDLE:
+    stepper.disable();
+    break;
+
+  default:
+    Serial.printf("Unknown state %d\n", state);
+    break;
+  }
+
+}
+
+void checkUSBSerial() { 
+  while (Serial.available()) {
+    char inChar = (char)Serial.read();
+    inputString += inChar;
+    if (inChar == '\n') {
+      handle_cmd();
+    }
+  }
+}
+
+void handle_cmd() {
+  inputString.trim(); // removes beginning and ending white spaces
+  int idx = inputString.indexOf(' ');   
+  String cmd = inputString.substring(0, idx); 
+  String value = inputString.substring(idx + 1);
+
+  if ((cmd.length() > 0)) {
+    if (cmd.equals("probe_device")) {
+      Serial.println("solder dispeser");
+    }
+    if (cmd.equals("run")) {
+      Serial.println("running");
+      state = S_MOTOR_PULSE;
+    }
+    if (cmd.equals("P1")) {
+      Serial.println("set P1");
+      state = S_MOTOR_PULSE;
+    }
+    if (cmd.equals("idle")) {
+      Serial.println(cmd);
+      state = S_IDLE;
+    }
+    inputString = "";
+  }
+}
+
